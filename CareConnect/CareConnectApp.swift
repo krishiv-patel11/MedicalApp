@@ -58,7 +58,8 @@ struct RootView: View {
     var body: some View {
         Group {
             if authViewModel.isLoggedIn {
-                HomeView(viewModel: MainViewModel(dailyPointsVM: dailyPointsVM))
+                HomeView(viewModel: MainViewModel())
+                    .environmentObject(dailyPointsVM)
                     .id(homeViewID)
             } else {
                 LoginView()

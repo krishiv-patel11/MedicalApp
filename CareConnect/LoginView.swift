@@ -90,9 +90,13 @@ struct LoginView: View {
 }
 
 class AuthViewModel: ObservableObject {
+
     @Published var isLoggedIn = false
     @Published var isLoading = false
     @Published var authError: String?
+
+    // Keeps RootView from switching to Home while signup onboarding is still happening.
+    @Published var isCreatingAccount = false
 
     private var authStateListenerHandle: AuthStateDidChangeListenerHandle?
 
@@ -104,8 +108,34 @@ class AuthViewModel: ObservableObject {
     private func listenToAuthState() {
         authStateListenerHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
             DispatchQueue.main.async {
-                self?.isLoggedIn = (user != nil)
+                guard let self = self else { return }
+
+                // During signup onboarding, Firebase will report a logged-in user.
+                // Do not let that immediately replace SignUpView with HomeView.
+                if self.isCreatingAccount {
+                    return
+                }
+
+                self.isLoggedIn = (user != nil)
             }
+        }
+    }
+
+    func beginAccountCreation() {
+        DispatchQueue.main.async {
+            self.isCreatingAccount = true
+            self.isLoggedIn = false
+            self.authError = nil
+        }
+    }
+
+    func completeAccountCreation() {
+        DispatchQueue.main.async {
+            self.isCreatingAccount = false
+            self.isLoggedIn = Auth.auth().currentUser != nil
+            self.authError = nil
+
+            print("Account onboarding completed.")
         }
     }
 
@@ -115,13 +145,22 @@ class AuthViewModel: ObservableObject {
         }
     }
 
-    func signInWithEmail(email: String, password: String, completion: @escaping (String?) -> Void) {
+    func signInWithEmail(
+        email: String,
+        password: String,
+        completion: @escaping (String?) -> Void
+    ) {
         isLoading = true
         authError = nil
 
-        Auth.auth().signIn(withEmail: email, password: password) { [weak self] result, error in
+        Auth.auth().signIn(
+            withEmail: email,
+            password: password
+        ) { [weak self] result, error in
+
             DispatchQueue.main.async {
                 self?.isLoading = false
+
                 if let error = error {
                     self?.authError = error.localizedDescription
                     completion(error.localizedDescription)
@@ -141,10 +180,12 @@ class AuthViewModel: ObservableObject {
         }
 
         let config = GIDConfiguration(clientID: clientID)
+
         guard let rootVC = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .flatMap({ $0.windows })
             .first(where: { $0.isKeyWindow })?.rootViewController else {
+
             print("Could not get root view controller")
             self.authError = "Root view controller not found"
             return
@@ -155,28 +196,38 @@ class AuthViewModel: ObservableObject {
 
         GIDSignIn.sharedInstance.configuration = config
 
-        GIDSignIn.sharedInstance.signIn(withPresenting: rootVC) { [weak self] result, error in
+        GIDSignIn.sharedInstance.signIn(
+            withPresenting: rootVC
+        ) { [weak self] result, error in
+
             guard let self = self else { return }
 
             if let error = error {
                 DispatchQueue.main.async {
                     self.isLoading = false
+
                     if (error as NSError).code == GIDSignInError.canceled.rawValue {
                         print("Google Sign-In was canceled.")
                     } else {
-                        print("Google Sign-In failed: \(error.localizedDescription)")
+                        print(
+                            "Google Sign-In failed: \(error.localizedDescription)"
+                        )
                         self.authError = error.localizedDescription
                     }
                 }
+
                 return
             }
 
             guard let user = result?.user,
                   let idToken = user.idToken else {
+
                 DispatchQueue.main.async {
                     self.isLoading = false
-                    self.authError = "Missing Google token information."
+                    self.authError =
+                        "Missing Google token information."
                 }
+
                 return
             }
 
@@ -185,12 +236,20 @@ class AuthViewModel: ObservableObject {
                 accessToken: user.accessToken.tokenString
             )
 
-            Auth.auth().signIn(with: credential) { _, error in
+            Auth.auth().signIn(
+                with: credential
+            ) { _, error in
+
                 DispatchQueue.main.async {
                     self.isLoading = false
+
                     if let error = error {
-                        self.authError = error.localizedDescription
-                        print("Firebase sign-in failed: \(error.localizedDescription)")
+                        self.authError =
+                            error.localizedDescription
+
+                        print(
+                            "Firebase sign-in failed: \(error.localizedDescription)"
+                        )
                     } else {
                         self.authError = nil
                         print("Google sign-in succeeded.")
@@ -203,12 +262,19 @@ class AuthViewModel: ObservableObject {
     func signOut() {
         do {
             try Auth.auth().signOut()
+
             self.authError = nil
             self.isLoggedIn = false
+            self.isCreatingAccount = false
+
             print("User signed out")
+
         } catch {
             self.authError = error.localizedDescription
-            print("Sign out error: \(error.localizedDescription)")
+
+            print(
+                "Sign out error: \(error.localizedDescription)"
+            )
         }
     }
 }

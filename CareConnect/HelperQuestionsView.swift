@@ -4,6 +4,7 @@ import FirebaseFirestore
 
 struct HelperQuestionsView: View {
     var userData: [String: Any]
+    let onCompleted: () -> Void
     @Environment(\.dismiss) var dismiss
     @State private var selectedServices: Set<String> = []
     @State private var selectedDays: Set<String> = []
@@ -84,6 +85,7 @@ struct HelperQuestionsView: View {
             if let error = error {
                 errorMessage = "Error saving data: \(error.localizedDescription)"
             } else {
+                onCompleted()
                 dismiss()
             }
         }

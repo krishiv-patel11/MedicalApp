@@ -1,59 +1,108 @@
+
 import SwiftUI
 import FirebaseFirestore
+import Firebase
 import FirebaseAuth
 import Firebase
 import AVFoundation
 
+
 struct CalendarEvent: Identifiable, Codable, Equatable {
     @DocumentID var id: String?
+
     var name: String
     var date: Date
     var type: String
-    
+    var helpCardID: String?
+
     init(fromHelpCard card: HelpCard, date: Date) {
-        self.id = card.id
+        let cardID = card.id ?? card.title
+        self.id = "help_\(cardID)_\(Int(date.timeIntervalSince1970))"
         self.name = card.title
         self.date = date
-        self.type = card.type
+        self.type = card.postType ?? "Help"
+        self.helpCardID = card.id
     }
-    
+
     init(name: String, date: Date, type: String) {
         self.id = UUID().uuidString
         self.name = name
         self.date = date
         self.type = type
+        self.helpCardID = nil
     }
 }
 
 struct CalendarView: View {
-    @State private var events: [CalendarEvent] = []
+    @State private var manualEvents: [CalendarEvent] = []
     @State private var selectedDate = Date()
     @State private var showAddEvent = false
-    
+
     @EnvironmentObject var dailyPointsVM: DailyPointsViewModel
     @EnvironmentObject var accessibilitySettings: AccessibilitySettings
     @ObservedObject var viewModel: MainViewModel
-    
+
     private let calendar = Calendar.current
     private let db = Firestore.firestore()
+
+    
+    private var acceptedHelpEvents: [CalendarEvent] {
+        let currentUserID = Auth.auth().currentUser?.uid
+
+        return viewModel.helpCards
+            .filter { card in
+                guard card.isCommitted,
+                      let currentUserID else {
+                    return false
+                }
+
+                // The current user is either the card owner
+                // (requester) or the person who accepted it.
+                return card.ownerId == currentUserID
+                    || card.committedBy == currentUserID
+            }
+            .flatMap { card in
+                card.availabilityDates
+                    .filter { $0 >= Calendar.current.startOfDay(for: Date()) }
+                    .map { date in
+                        CalendarEvent(fromHelpCard: card, date: date)
+                    }
+            }
+            .sorted { $0.date < $1.date }
+    }
+    
+    private func formattedEventType(_ type: String) -> String {
+        switch type.lowercased() {
+        case "help_offer":
+            return "Help Offer"
+        case "support_request":
+            return "Support Request"
+        default:
+            return type.capitalized
+        }
+    }
+
+    private var events: [CalendarEvent] {
+        (manualEvents + acceptedHelpEvents)
+            .sorted { $0.date < $1.date }
+    }
 
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 24) {
-                    
                     if let next = nextEvent {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Next Event")
                                 .font(.headline)
                                 .foregroundColor(.white.opacity(0.8))
-                            
+
                             Text(next.name)
                                 .font(.title2)
                                 .fontWeight(.bold)
                                 .foregroundColor(.white)
-                            
-                            Text("\(formattedDate(next.date)), \(formattedTime(next.date)) • \(next.type.capitalized)")
+
+                            Text("\(formattedDate(next.date)), \(formattedTime(next.date)) • \(formattedEventType(next.type))")
                                 .font(.subheadline)
                                 .foregroundColor(.white.opacity(0.7))
                         }
@@ -62,14 +111,17 @@ struct CalendarView: View {
                         .background(eventTypeColor(next.type).opacity(0.2))
                         .cornerRadius(16)
                         .shadow(color: .black.opacity(0.25), radius: 4, y: 2)
-                        .animation(.easeInOut, value: next)
                     }
-                    
-                    MonthlyCalendarView(selectedDate: $selectedDate, events: events)
-                        .padding(.horizontal)
-                    
+
+                    MonthlyCalendarView(
+                        selectedDate: $selectedDate,
+                        events: events
+                    )
+                    .padding(.horizontal)
+
                     sectionCard(title: "Events on \(formattedDate(selectedDate))") {
                         let dayEvents = eventsForDay(selectedDate)
+
                         if dayEvents.isEmpty {
                             Text("No events.")
                                 .foregroundColor(.gray)
@@ -81,9 +133,10 @@ struct CalendarView: View {
                             }
                         }
                     }
-                    
+
                     sectionCard(title: "Upcoming Events This Week") {
                         let weekEvents = eventsThisWeek
+
                         if weekEvents.isEmpty {
                             Text("No events this week.")
                                 .foregroundColor(.gray)
@@ -95,12 +148,25 @@ struct CalendarView: View {
                             }
                         }
                     }
-                    
+
+                    sectionCard(title: "Accepted Help Opportunities") {
+                        if acceptedHelpEvents.isEmpty {
+                            Text("No accepted help opportunities yet.")
+                                .foregroundColor(.gray)
+                                .padding(.vertical, 4)
+                        } else {
+                            ForEach(acceptedHelpEvents) { event in
+                                eventRow(event)
+                                    .padding(.vertical, 4)
+                            }
+                        }
+                    }
+
                     Spacer(minLength: 100)
                 }
                 .padding(.top)
             }
-            .background(Color.black.edgesIgnoringSafeArea(.all))
+            .background(Color.black.ignoresSafeArea())
             .navigationTitle("My Calendar")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showAddEvent) {
@@ -111,103 +177,150 @@ struct CalendarView: View {
             }
             .onAppear {
                 fetchEvents()
-                mergeCommittedHelpCards(viewModel.committedCards)
-            }
-            .onChange(of: viewModel.committedCards) { newCommittedCards in
-                mergeCommittedHelpCards(newCommittedCards)
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
-        .overlay(
-            Button(action: { showAddEvent.toggle() }) {
+        .overlay(alignment: .bottomTrailing) {
+            Button {
+                showAddEvent = true
+            } label: {
                 Image(systemName: "plus.circle.fill")
                     .font(.system(size: 46))
                     .foregroundColor(.blue)
                     .shadow(radius: 2)
             }
-                .padding(),
-            alignment: .bottomTrailing
-        )
+            .padding()
+        }
     }
-    
-    private func sectionCard<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+
+    private func sectionCard<Content: View>(
+        title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title)
                 .font(.headline)
                 .foregroundColor(.white)
+
             content()
         }
         .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white.opacity(0.05))
         .cornerRadius(16)
         .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
         .padding(.horizontal)
     }
-    
+
     private func eventRow(_ event: CalendarEvent) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Circle()
-                .fill(eventTypeColor(event.type).opacity(0.35))
+                .fill(eventTypeColor(event.type))
                 .frame(width: 12, height: 12)
-            
-            VStack(alignment: .leading, spacing: 2) {
+                .padding(.top, 4)
+
+            VStack(alignment: .leading, spacing: 4) {
                 Text(event.name)
                     .font(.subheadline)
                     .fontWeight(.semibold)
                     .foregroundColor(.white)
-                
-                Text("\(formattedDate(event.date)), \(formattedTime(event.date)) • \(event.type.capitalized)")
+
+                Text("\(formattedDate(event.date)), \(formattedTime(event.date))")
                     .font(.footnote)
                     .foregroundColor(.gray)
+
+                Text(formattedEventType(event.type))
+                    .font(.caption)
+                    .foregroundColor(eventTypeColor(event.type))
             }
-            
+
             Spacer()
         }
         .padding(.vertical, 4)
     }
-    
+
     private func eventTypeColor(_ type: String) -> Color {
         switch type.lowercased() {
-        case "important": return .red
-        case "medical": return .blue
-        case "appointment": return .yellow
-        case "personal": return .green
-        default: return .purple
+        case "important":
+            return .red
+        case "medical":
+            return .blue
+        case "appointment":
+            return .yellow
+        case "personal":
+            return .green
+        case "help", "support", "request", "offer":
+            return .purple
+        default:
+            return .purple
         }
     }
-    
+
     private var nextEvent: CalendarEvent? {
-        events.first(where: { $0.date > Date() })
+        events.first { $0.date >= Date() }
     }
 
     private func eventsForDay(_ date: Date) -> [CalendarEvent] {
-        events.filter { calendar.isDate($0.date, inSameDayAs: date) }
+        events.filter {
+            calendar.isDate($0.date, inSameDayAs: date)
+        }
     }
 
     private var eventsThisWeek: [CalendarEvent] {
-        guard let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())),
-              let endOfWeek = calendar.date(byAdding: .day, value: 7, to: startOfWeek) else {
+        guard
+            let startOfWeek = calendar.date(
+                from: calendar.dateComponents(
+                    [.yearForWeekOfYear, .weekOfYear],
+                    from: Date()
+                )
+            ),
+            let endOfWeek = calendar.date(
+                byAdding: .day,
+                value: 7,
+                to: startOfWeek
+            )
+        else {
             return []
         }
-        return events.filter { $0.date >= Date() && $0.date < endOfWeek }
+
+        return events.filter {
+            $0.date >= Date() && $0.date < endOfWeek
+        }
     }
 
     private func formattedDate(_ date: Date) -> String {
-        DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .none)
+        DateFormatter.localizedString(
+            from: date,
+            dateStyle: .medium,
+            timeStyle: .none
+        )
     }
 
     private func formattedTime(_ date: Date) -> String {
-        DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short)
+        DateFormatter.localizedString(
+            from: date,
+            dateStyle: .none,
+            timeStyle: .short
+        )
     }
-    
-    private func fetchEvents() {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
 
-        db.collection("users").document(uid).collection("calendarEvents")
+    private func fetchEvents() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            manualEvents = []
+            return
+        }
+
+        db.collection("users")
+            .document(uid)
+            .collection("calendarEvents")
             .order(by: "date")
             .getDocuments { snapshot, error in
-                guard let snapshot = snapshot else {
-                    print("Fetch error: \(error?.localizedDescription ?? "Unknown error")")
+                if let error {
+                    print("Calendar fetch error: \(error.localizedDescription)")
+                    return
+                }
+
+                guard let snapshot else {
                     return
                 }
 
@@ -215,71 +328,97 @@ struct CalendarView: View {
                     let fetchedEvents = try snapshot.documents.compactMap {
                         try $0.data(as: CalendarEvent.self)
                     }
+
                     DispatchQueue.main.async {
-                        self.events = fetchedEvents
-                        mergeCommittedHelpCards(viewModel.committedCards)
+                        manualEvents = fetchedEvents.sorted {
+                            $0.date < $1.date
+                        }
                     }
                 } catch {
-                    print("Decoding error: \(error)")
+                    print("Calendar decoding error: \(error)")
                 }
             }
     }
 
     private func addEventToFirestore(_ event: CalendarEvent) {
-        guard let uid = Auth.auth().currentUser?.uid else { return }
+        guard let uid = Auth.auth().currentUser?.uid else {
+            return
+        }
 
-        var pendingEvent = event
-        pendingEvent.id = UUID().uuidString
-        self.events.append(pendingEvent)
-        self.events.sort { $0.date < $1.date }
+        var localEvent = event
+        let localID = UUID().uuidString
+        localEvent.id = localID
+
+        manualEvents.append(localEvent)
+        manualEvents.sort { $0.date < $1.date }
+
+        var eventToSave = event
+        eventToSave.id = nil
 
         do {
-            var ref: DocumentReference? = nil
-            ref = try db.collection("users").document(uid).collection("calendarEvents")
-                .addDocument(from: event) { err in
-                    if let err = err {
-                        print("Error adding event: \(err.localizedDescription)")
-                    } else if let docID = ref?.documentID {
-                        DispatchQueue.main.async {
-                            self.events.removeAll { $0.id == pendingEvent.id }
-                            var savedEvent = event
-                            savedEvent.id = docID
-                            self.events.append(savedEvent)
-                            self.events.sort { $0.date < $1.date }
-                            self.dailyPointsVM.addPoints(3)
+            var documentReference: DocumentReference?
+
+            documentReference = try db.collection("users")
+                .document(uid)
+                .collection("calendarEvents")
+                .addDocument(from: eventToSave) { error in
+                    DispatchQueue.main.async {
+                        if let error {
+                            manualEvents.removeAll {
+                                $0.id == localID
+                            }
+
+                            print(
+                                "Error adding calendar event: \(error.localizedDescription)"
+                            )
+                            return
                         }
+
+                        guard let documentID = documentReference?.documentID else {
+                            return
+                        }
+
+                        if let index = manualEvents.firstIndex(
+                            where: { $0.id == localID }
+                        ) {
+                            manualEvents[index].id = documentID
+                        }
+
+                        manualEvents.sort { $0.date < $1.date }
+                        dailyPointsVM.addPoints(3)
                     }
                 }
         } catch {
-            print("Encoding error: \(error.localizedDescription)")
+            manualEvents.removeAll { $0.id == localID }
+            print("Calendar encoding error: \(error.localizedDescription)")
         }
-    }
-
-    private func mergeCommittedHelpCards(_ committedCards: [HelpCard]) {
-        let newEvents = committedCards.flatMap { card in
-            card.availabilityDates.map { date in
-                CalendarEvent(fromHelpCard: card, date: date)
-            }
-        }
-        
-        let allEvents = events.filter { e in
-            !newEvents.contains { $0.id == e.id }
-        } + newEvents
-        
-        self.events = allEvents.sorted { $0.date < $1.date }
     }
 }
 
 struct MonthlyCalendarView: View {
     @Binding var selectedDate: Date
     let events: [CalendarEvent]
-    
+
     private let calendar = Calendar.current
-    private let columns = Array(repeating: GridItem(.flexible()), count: 7)
+    private let columns = Array(
+        repeating: GridItem(.flexible()),
+        count: 7
+    )
 
     private var monthDates: [Date] {
-        guard let range = calendar.range(of: .day, in: .month, for: selectedDate),
-              let firstDay = calendar.date(from: calendar.dateComponents([.year, .month], from: selectedDate)) else {
+        guard
+            let range = calendar.range(
+                of: .day,
+                in: .month,
+                for: selectedDate
+            ),
+            let firstDay = calendar.date(
+                from: calendar.dateComponents(
+                    [.year, .month],
+                    from: selectedDate
+                )
+            )
+        else {
             return []
         }
 
@@ -288,25 +427,57 @@ struct MonthlyCalendarView: View {
         let firstWeekdayIndex = calendar.firstWeekday
         let offset = (weekdayOfFirst - firstWeekdayIndex + 7) % 7
 
-        for _ in 0..<offset { dates.append(Date.distantPast) }
+        for _ in 0..<offset {
+            dates.append(Date.distantPast)
+        }
+
         for day in range {
-            if let date = calendar.date(byAdding: .day, value: day - 1, to: firstDay) {
+            if let date = calendar.date(
+                byAdding: .day,
+                value: day - 1,
+                to: firstDay
+            ) {
                 dates.append(date)
             }
         }
+
         return dates
     }
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(monthTitle)
-                .font(.title2)
-                .fontWeight(.semibold)
-                .foregroundColor(.white)
-                .padding(.vertical, 6)
+            HStack {
+                Button {
+                    changeMonth(by: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .foregroundColor(.blue)
+                }
 
-            LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"], id: \.self) { day in
+                Spacer()
+
+                Text(monthTitle)
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                Button {
+                    changeMonth(by: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .foregroundColor(.blue)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(
+                    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+                    id: \.self
+                ) { day in
                     Text(day)
                         .font(.caption)
                         .foregroundColor(.gray)
@@ -314,36 +485,11 @@ struct MonthlyCalendarView: View {
                 }
 
                 ForEach(monthDates, id: \.self) { date in
-                    if calendar.isDate(date, equalTo: Date.distantPast, toGranularity: .day) {
-                        Color.clear.frame(width: 36, height: 36)
+                    if date == Date.distantPast {
+                        Color.clear
+                            .frame(height: 48)
                     } else {
-                        let isToday = calendar.isDateInToday(date)
-                        let isSelected = calendar.isDate(date, inSameDayAs: selectedDate)
-                        let hasEvents = eventsForDay(date).count > 0
-
-                        VStack(spacing: 4) {
-                            Text("\(calendar.component(.day, from: date))")
-                                .fontWeight(isSelected ? .bold : .regular)
-                                .foregroundColor(isSelected ? Color.blue.opacity(0.9) : (isToday ? Color.blue.opacity(0.8) : .white))
-                                .frame(width: 36, height: 36)
-
-                            if hasEvents {
-                                HStack(spacing: 4) {
-                                    ForEach(Array(Set(eventsForDay(date).map { $0.type.lowercased() })).prefix(3), id: \.self) { type in
-                                        Circle()
-                                            .fill(eventTypeColor(type).opacity(0.35))
-                                            .frame(width: 6, height: 6)
-                                    }
-                                }
-                            } else {
-                                Spacer().frame(height: 6)
-                            }
-                        }
-                        .padding(6)
-                        .background(isSelected ? Color.blue.opacity(0.2) : Color.clear)
-                        .cornerRadius(8)
-                        .contentShape(Rectangle())
-                        .onTapGesture { selectedDate = date }
+                        dayCell(date)
                     }
                 }
             }
@@ -351,8 +497,79 @@ struct MonthlyCalendarView: View {
         .padding(.vertical, 12)
     }
 
+    private func dayCell(_ date: Date) -> some View {
+        let isToday = calendar.isDateInToday(date)
+        let isSelected = calendar.isDate(
+            date,
+            inSameDayAs: selectedDate
+        )
+        let dayEvents = eventsForDay(date)
+
+        return Button {
+            selectedDate = date
+        } label: {
+            VStack(spacing: 4) {
+                Text("\(calendar.component(.day, from: date))")
+                    .fontWeight(isSelected ? .bold : .regular)
+                    .foregroundColor(
+                        isSelected
+                        ? .white
+                        : (isToday ? .blue : .white)
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 30)
+
+                HStack(spacing: 3) {
+                    ForEach(
+                        Array(Set(dayEvents.map { $0.type.lowercased() }))
+                            .sorted()
+                            .prefix(3),
+                        id: \.self
+                    ) { type in
+                        Circle()
+                            .fill(eventTypeColor(type))
+                            .frame(width: 5, height: 5)
+                    }
+                }
+                .frame(height: 6)
+            }
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(
+                        isSelected
+                        ? Color.blue.opacity(0.65)
+                        : Color.clear
+                    )
+            )
+            .overlay {
+                if isToday && !isSelected {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.blue, lineWidth: 1)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func changeMonth(by amount: Int) {
+        guard let newDate = calendar.date(
+            byAdding: .month,
+            value: amount,
+            to: selectedDate
+        ) else {
+            return
+        }
+
+        selectedDate = newDate
+    }
+
     private func eventsForDay(_ date: Date) -> [CalendarEvent] {
-        events.filter { calendar.isDate($0.date, inSameDayAs: date) }
+        events.filter {
+            calendar.isDate($0.date, inSameDayAs: date)
+        }
     }
 
     private var monthTitle: String {
@@ -363,24 +580,38 @@ struct MonthlyCalendarView: View {
 
     private func eventTypeColor(_ type: String) -> Color {
         switch type.lowercased() {
-        case "important": return .red
-        case "medical": return .blue
-        case "appointment": return .yellow
-        case "personal": return .green
-        default: return .purple
+        case "important":
+            return .red
+        case "medical":
+            return .blue
+        case "appointment":
+            return .yellow
+        case "personal":
+            return .green
+        case "help", "support", "request", "offer":
+            return .purple
+        default:
+            return .purple
         }
     }
 }
 
 struct AddEventView: View {
-    @Environment(\.dismiss) var dismiss
+    @Environment(\.dismiss) private var dismiss
+
     var onSave: (CalendarEvent) -> Void
 
     @State private var name = ""
     @State private var date = Date()
     @State private var type = "important"
 
-    let eventTypes = ["important", "medical", "appointment", "personal", "other"]
+    private let eventTypes = [
+        "important",
+        "medical",
+        "appointment",
+        "personal",
+        "other"
+    ]
 
     var body: some View {
         NavigationView {
@@ -395,23 +626,49 @@ struct AddEventView: View {
                     )
 
                     Picker("Type", selection: $type) {
-                        ForEach(eventTypes, id: \.self) { t in
-                            Text(t.capitalized)
+                        ForEach(eventTypes, id: \.self) { eventType in
+                            Text(eventType.capitalized)
+                                .tag(eventType)
                         }
                     }
-                    .pickerStyle(SegmentedPickerStyle())
+                    .pickerStyle(.menu)
                 }
             }
-            .navigationBarTitle("New Event", displayMode: .inline)
-            .navigationBarItems(
-                leading: Button("Cancel") { dismiss() },
-                trailing: Button("Save") {
-                    let event = CalendarEvent(name: name, date: date, type: type)
-                    onSave(event)
-                    dismiss()
+            .navigationTitle("New Event")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
                 }
-                .disabled(name.isEmpty)
-            )
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let trimmedName = name.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        )
+
+                        guard !trimmedName.isEmpty else {
+                            return
+                        }
+
+                        let event = CalendarEvent(
+                            name: trimmedName,
+                            date: date,
+                            type: type
+                        )
+
+                        onSave(event)
+                        dismiss()
+                    }
+                    .disabled(
+                        name.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty
+                    )
+                }
+            }
         }
         .preferredColorScheme(.dark)
     }

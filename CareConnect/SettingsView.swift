@@ -256,7 +256,7 @@ struct SettingsView: View {
                         SpeakableLabel(title: "Account", systemImage: "person.circle")
                     }
                 }
-
+                
                 Section(header:
                     WordSpeakableText(text: "App Settings")
                         .font(.system(size: 17))

@@ -1,271 +1,422 @@
 import SwiftUI
-import Foundation
-import Firebase
 import FirebaseAuth
 import FirebaseFirestore
 
-struct CommunityMessage: Identifiable, Codable {
-    @DocumentID var id: String?
-    var userId: String
-    var name: String
-    var role: String
-    var message: String
-    var timestamp: Date
+struct CommunityConversation: Identifiable {
+    let id: String
+    let participants: [String]
+    let participantNames: [String: String]
+    let helpCardTitle: String
+    let lastMessage: String
+    let updatedAt: Date?
 }
 
-class CommunityViewModel: ObservableObject {
-    @Published var messages: [CommunityMessage] = []
-    @Published var newMessage: String = ""
-    @Published var name: String = "Anonymous"
-    @Published var role: String = ""
-    @Published var isAnonymous: Bool = false
+struct CommunityChatMessage: Identifiable {
+    let id: String
+    let senderId: String
+    let senderName: String
+    let text: String
+    let timestamp: Date?
+    let isSystemMessage: Bool
+}
 
-    private var db = Firestore.firestore()
-    private var listenerRegistration: ListenerRegistration?
+@MainActor
+final class CommunityViewModel: ObservableObject {
+    @Published var conversations: [CommunityConversation] = []
+    @Published var errorMessage: String?
 
-    var dailyPointsVM: DailyPointsViewModel
+    private let db = Firestore.firestore()
+    private var listener: ListenerRegistration?
 
-    init(dailyPointsVM: DailyPointsViewModel) {
-        self.dailyPointsVM = dailyPointsVM
-        fetchMessages()
-        fetchCurrentUserInfo()
+    func startListening() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            errorMessage = "Please sign in to view your conversations."
+            return
+        }
+
+        listener?.remove()
+
+        listener = db.collection("conversations")
+            .whereField("participants", arrayContains: uid)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+
+                if let error {
+                    Task { @MainActor in
+                        self.errorMessage = error.localizedDescription
+                    }
+                    return
+                }
+
+                let results = snapshot?.documents.compactMap { doc -> CommunityConversation? in
+                    let data = doc.data()
+
+                    return CommunityConversation(
+                        id: doc.documentID,
+                        participants: data["participants"] as? [String] ?? [],
+                        participantNames: data["participantNames"] as? [String: String] ?? [:],
+                        helpCardTitle: data["helpCardTitle"] as? String ?? "Help request",
+                        lastMessage: data["lastMessage"] as? String ?? "",
+                        updatedAt: (data["updatedAt"] as? Timestamp)?.dateValue()
+                    )
+                } ?? []
+
+                Task { @MainActor in
+                    self.conversations = results.sorted {
+                        ($0.updatedAt ?? .distantPast) >
+                        ($1.updatedAt ?? .distantPast)
+                    }
+                }
+            }
+    }
+
+    func stopListening() {
+        listener?.remove()
+        listener = nil
     }
 
     deinit {
-        listenerRegistration?.remove()
-    }
-
-    func fetchCurrentUserInfo() {
-        guard let user = Auth.auth().currentUser else { return }
-        let uid = user.uid
-        db.collection("users").document(uid).getDocument { [weak self] snapshot, error in
-            guard let self = self else { return }
-            if let data = snapshot?.data() {
-                self.name = data["name"] as? String ?? user.displayName ?? "User"
-                var rawRole = (data["role"] as? String ?? "Member")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-
-                switch rawRole {
-                case "in_need": rawRole = "Seeking Support"
-                case "helper": rawRole = "Helper"
-                default: break
-                }
-
-                self.role = rawRole.capitalized
-            }
-        }
-    }
-
-    func fetchMessages() {
-        listenerRegistration = db.collection("community_messages")
-            .order(by: "timestamp", descending: false)
-            .addSnapshotListener { [weak self] snapshot, error in
-                guard let self = self else { return }
-                guard let documents = snapshot?.documents else { return }
-                self.messages = documents.compactMap { doc in
-                    try? doc.data(as: CommunityMessage.self)
-                }
-            }
-    }
-
-    func sendMessage() {
-        guard let user = Auth.auth().currentUser else { return }
-        let trimmed = newMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        let finalName = isAnonymous ? "Anonymous" : name
-        let finalRole = isAnonymous ? "Anonymous" : role
-
-        let message = CommunityMessage(
-            userId: user.uid,
-            name: finalName,
-            role: finalRole,
-            message: trimmed,
-            timestamp: Date()
-        )
-
-        do {
-            _ = try db.collection("community_messages").addDocument(from: message)
-            newMessage = ""
-            dailyPointsVM.addPoints(1)
-        } catch {
-            print("Error sending message: \(error)")
-        }
-    }
-
-    func deleteMessage(_ message: CommunityMessage) {
-        guard message.userId == Auth.auth().currentUser?.uid, let id = message.id else { return }
-        db.collection("community_messages").document(id).delete()
+        listener?.remove()
     }
 }
 
 struct CommunityView: View {
-    @EnvironmentObject var dailyPointsVM: DailyPointsViewModel
-    @StateObject private var viewModel: CommunityViewModel
-
-    init() {
-        _viewModel = StateObject(wrappedValue: CommunityViewModel(dailyPointsVM: DailyPointsViewModel()))
-    }
+    @StateObject private var viewModel = CommunityViewModel()
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 0) {
-                headerSection
-                chatScrollView
-                Divider()
-                inputSection
-                    .padding(.bottom, 30)
-                    .background(Color(UIColor.systemBackground))
-            }
-            .navigationTitle("")
-            .navigationBarHidden(true)
-            .background(Color(UIColor.systemBackground))
-            .onAppear {
-                viewModel.dailyPointsVM = dailyPointsVM
-            }
-        }
-    }
-
-    private var headerSection: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                WordSpeakableText(text: "Community Chat")
-                    .font(.system(size: 22, weight: .bold))
-                Text("Logged in as: \(viewModel.isAnonymous ? "Anonymous" : viewModel.name) - \(viewModel.role)")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-            Button(action: {
-                viewModel.isAnonymous.toggle()
-            }) {
-                Image(systemName: viewModel.isAnonymous ? "eye.slash.fill" : "eye.fill")
-                    .font(.system(size: 20))
-                    .foregroundColor(.accentColor)
-            }
-            .padding(.trailing)
-        }
-        .padding()
-        .background(.ultraThinMaterial)
-        .overlay(Divider(), alignment: .bottom)
-    }
-
-    private var chatScrollView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    ForEach(viewModel.messages) { msg in
-                        MessageBubble(
-                            message: msg,
-                            currentUserId: Auth.auth().currentUser?.uid ?? "",
-                            onDelete: {
-                                viewModel.deleteMessage(msg)
-                            }
+            Group {
+                if let error = viewModel.errorMessage {
+                    ContentUnavailableView(
+                        "Unable to Load Community",
+                        systemImage: "exclamationmark.bubble",
+                        description: Text(error)
+                    )
+                } else if viewModel.conversations.isEmpty {
+                    ContentUnavailableView(
+                        "No Conversations Yet",
+                        systemImage: "bubble.left.and.bubble.right",
+                        description: Text(
+                            "When you accept or receive an accepted help request, your private conversation will appear here."
                         )
-                        .id(msg.id ?? UUID().uuidString)
+                    )
+                } else {
+                    List(viewModel.conversations) { conversation in
+                        NavigationLink {
+                            CommunityChatView(conversation: conversation)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(otherParticipantName(conversation))
+                                    .font(.headline)
+
+                                Text(conversation.helpCardTitle)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+
+                                Text(conversation.lastMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+
+                                if let date = conversation.updatedAt {
+                                    Text(date.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .padding(.vertical, 5)
+                        }
                     }
+                    .listStyle(.insetGrouped)
                 }
-                .padding(.vertical)
-                .padding(.horizontal, 10)
             }
-            .onChange(of: viewModel.messages.count) { _ in
-                if let last = viewModel.messages.last?.id {
-                    withAnimation {
-                        proxy.scrollTo(last, anchor: .bottom)
-                    }
-                }
+            .navigationTitle("Community")
+            .onAppear {
+                viewModel.startListening()
+            }
+            .onDisappear {
+                viewModel.stopListening()
             }
         }
     }
 
-    private var inputSection: some View {
-        HStack(spacing: 10) {
-            TextField("Type a message...", text: $viewModel.newMessage)
-                .font(.system(size: 17))
-                .padding(12)
-                .background(Color(UIColor.systemGray6))
-                .cornerRadius(10)
-
-            Button(action: {
-                viewModel.sendMessage()
-            }) {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 22))
-                    .foregroundColor(.white)
-                    .padding(12)
-                    .background(viewModel.newMessage.trimmingCharacters(in: .whitespaces).isEmpty ? Color.gray : Color.accentColor)
-                    .clipShape(Circle())
-            }
-            .disabled(viewModel.newMessage.trimmingCharacters(in: .whitespaces).isEmpty)
+    private func otherParticipantName(_ conversation: CommunityConversation) -> String {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            return "Conversation"
         }
-        .padding(.horizontal)
-        .padding(.top, 8)
+
+        let otherId = conversation.participants.first { $0 != uid }
+        return otherId.flatMap { conversation.participantNames[$0] } ?? "Community Member"
     }
 }
 
-struct MessageBubble: View {
-    let message: CommunityMessage
-    let currentUserId: String
-    var onDelete: () -> Void
+@MainActor
+final class CommunityChatViewModel: ObservableObject {
+    @Published var messages: [CommunityChatMessage] = []
+    @Published var draft = ""
+    @Published var errorMessage: String?
+    @Published var isSending = false
 
-    var isCurrentUser: Bool {
-        message.userId == currentUserId
+    private let db = Firestore.firestore()
+    private let conversationId: String
+    private var listener: ListenerRegistration?
+
+    init(conversationId: String) {
+        self.conversationId = conversationId
     }
 
-    var timeAgo: String {
-        let interval = Date().timeIntervalSince(message.timestamp)
-        let minute = 60.0, hour = 3600.0, day = 86400.0, month = 2592000.0, year = 31536000.0
+    func startListening() {
+        listener?.remove()
 
-        switch interval {
-        case 0..<minute: return "Just now"
-        case minute..<hour: return "\(Int(interval / minute)) min ago"
-        case hour..<day: return "\(Int(interval / hour)) hr ago"
-        case day..<month: return "\(Int(interval / day)) days ago"
-        case month..<year: return "\(Int(interval / month)) mo ago"
-        default: return "\(Int(interval / year)) yr ago"
+        listener = db.collection("conversations")
+            .document(conversationId)
+            .collection("messages")
+            .order(by: "timestamp", descending: false)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self else { return }
+
+                if let error {
+                    Task { @MainActor in
+                        self.errorMessage = error.localizedDescription
+                    }
+                    return
+                }
+
+                let results = snapshot?.documents.compactMap { doc -> CommunityChatMessage? in
+                    let data = doc.data()
+
+                    return CommunityChatMessage(
+                        id: doc.documentID,
+                        senderId: data["senderId"] as? String ?? "",
+                        senderName: data["senderName"] as? String ?? "Community Member",
+                        text: data["text"] as? String ?? "",
+                        timestamp: (data["timestamp"] as? Timestamp)?.dateValue(),
+                        isSystemMessage: data["isSystemMessage"] as? Bool ?? false
+                    )
+                } ?? []
+
+                Task { @MainActor in
+                    self.messages = results
+                }
+            }
+    }
+
+    func stopListening() {
+        listener?.remove()
+        listener = nil
+    }
+
+    func sendMessage() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            errorMessage = "Please sign in to send a message."
+            return
         }
+
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isSending else { return }
+
+        isSending = true
+        errorMessage = nil
+
+        let conversationRef = db.collection("conversations").document(conversationId)
+        let messageRef = conversationRef.collection("messages").document()
+
+        conversationRef.getDocument { [weak self] snapshot, error in
+            guard let self else { return }
+
+            if let error {
+                Task { @MainActor in
+                    self.isSending = false
+                    self.errorMessage = error.localizedDescription
+                }
+                return
+            }
+
+            guard let data = snapshot?.data(),
+                  let participants = data["participants"] as? [String],
+                  participants.contains(uid) else {
+                Task { @MainActor in
+                    self.isSending = false
+                    self.errorMessage = "You are not a participant in this conversation."
+                }
+                return
+            }
+
+            let userRef = self.db.collection("users").document(uid)
+
+            userRef.getDocument { userSnapshot, userError in
+                if let userError {
+                    Task { @MainActor in
+                        self.isSending = false
+                        self.errorMessage = userError.localizedDescription
+                    }
+                    return
+                }
+
+                let userData = userSnapshot?.data() ?? [:]
+                let name = userData["name"] as? String ?? "Community Member"
+
+                let batch = self.db.batch()
+
+                batch.setData([
+                    "senderId": uid,
+                    "senderName": name,
+                    "text": text,
+                    "timestamp": FieldValue.serverTimestamp(),
+                    "isSystemMessage": false
+                ], forDocument: messageRef)
+
+                batch.updateData([
+                    "lastMessage": text,
+                    "updatedAt": FieldValue.serverTimestamp()
+                ], forDocument: conversationRef)
+
+                batch.commit { batchError in
+                    Task { @MainActor in
+                        self.isSending = false
+
+                        if let batchError {
+                            self.errorMessage = batchError.localizedDescription
+                        } else {
+                            self.draft = ""
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    deinit {
+        listener?.remove()
+    }
+}
+
+struct CommunityChatView: View {
+    let conversation: CommunityConversation
+
+    @StateObject private var viewModel: CommunityChatViewModel
+
+    init(conversation: CommunityConversation) {
+        self.conversation = conversation
+        _viewModel = StateObject(
+            wrappedValue: CommunityChatViewModel(conversationId: conversation.id)
+        )
     }
 
     var body: some View {
-        HStack {
-            if isCurrentUser { Spacer(minLength: 20) }
+        VStack(spacing: 0) {
+            if let error = viewModel.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+            }
 
-            VStack(alignment: isCurrentUser ? .trailing : .leading, spacing: 4) {
-                HStack(spacing: 4) {
-                    WordSpeakableText(text: message.name).font(.system(size: 12, weight: .semibold))
-                    WordSpeakableText(text: "- \(message.role.capitalized)")
-                        .font(.system(size: 10))
-                        .foregroundColor(.gray)
-                }
-                WordSpeakableText(text: message.message)
-                    .font(.system(size: 17))
-                    .padding(12)
-                    .background(isCurrentUser ? Color.accentColor : Color(UIColor.systemGray5))
-                    .foregroundColor(isCurrentUser ? .white : .primary)
-                    .cornerRadius(16)
-                    .shadow(color: Color.black.opacity(0.15), radius: 3, x: 1, y: 2)
-
-                HStack(spacing: 12) {
-                    WordSpeakableText(text: timeAgo)
-                        .font(.system(size: 10))
-                        .foregroundColor(.gray)
-                    if isCurrentUser {
-                        Button(action: onDelete) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 10))
-                                .foregroundColor(.red)
-                                .padding(4)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(viewModel.messages) { message in
+                            messageBubble(message)
+                                .id(message.id)
                         }
-                        .buttonStyle(BorderlessButtonStyle())
+                    }
+                    .padding()
+                }
+                .onChange(of: viewModel.messages.count) { _ in
+                    guard let lastId = viewModel.messages.last?.id else { return }
+                    withAnimation {
+                        proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: isCurrentUser ? .trailing : .leading)
             }
-            .frame(maxWidth: UIScreen.main.bounds.width * 0.75, alignment: isCurrentUser ? .trailing : .leading)
 
-            if !isCurrentUser { Spacer(minLength: 20) }
+            Divider()
+
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Write a message...", text: $viewModel.draft, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...5)
+
+                Button {
+                    viewModel.sendMessage()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 30))
+                }
+                .disabled(
+                    viewModel.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    viewModel.isSending
+                )
+                .accessibilityLabel("Send message")
+            }
+            .padding()
         }
-        .padding(.horizontal, 10)
+        .navigationTitle(otherParticipantName)
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            viewModel.startListening()
+        }
+        .onDisappear {
+            viewModel.stopListening()
+        }
+    }
+
+    private var otherParticipantName: String {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            return "Private Chat"
+        }
+
+        let otherId = conversation.participants.first { $0 != uid }
+        return otherId.flatMap { conversation.participantNames[$0] } ?? "Private Chat"
+    }
+
+    @ViewBuilder
+    private func messageBubble(_ message: CommunityChatMessage) -> some View {
+        if message.isSystemMessage {
+            VStack(spacing: 4) {
+                Text(message.senderName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+
+                Text(message.text)
+                    .font(.subheadline)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        } else {
+            let isMine = message.senderId == Auth.auth().currentUser?.uid
+
+            HStack {
+                if isMine { Spacer(minLength: 45) }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    if !isMine {
+                        Text(message.senderName)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(message.text)
+                        .font(.body)
+                        .textSelection(.enabled)
+
+                    if let date = message.timestamp {
+                        Text(date.formatted(date: .omitted, time: .shortened))
+                            .font(.caption2)
+                            .foregroundStyle(isMine ? .white.opacity(0.8) : .secondary)
+                    }
+                }
+                .padding(12)
+                .foregroundStyle(isMine ? .white : .primary)
+                .background(isMine ? Color.accentColor : Color.secondary.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                if !isMine { Spacer(minLength: 45) }
+            }
+        }
     }
 }
